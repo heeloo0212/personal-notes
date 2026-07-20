@@ -1,6 +1,10 @@
 ---
 title: Java 面试题（深度版）
-tags: [面试, Java, 后端, 深度]
+tags:
+  - 面试
+  - Java
+  - 后端
+  - 深度
 created: 2026-07-19
 ---
 
