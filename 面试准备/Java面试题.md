@@ -1,10 +1,6 @@
 ---
 title: Java 面试题（深度版）
-tags:
-  - 面试
-  - Java
-  - 后端
-  - 深度
+tags: [面试, Java, 后端, 深度]
 created: 2026-07-19
 ---
 
@@ -144,6 +140,128 @@ workerCountOf < corePoolSize        → addWorker(command, true)
 
 - Q：线程池如何保证线程不退出？ A：核心线程 `take()` 阻塞，非核心线程 `poll(keepAliveTime)` 超时返回 null 退出。
 - Q：线程池满了但队列还没满为什么是入队而不是创建新线程？ A：设计上优先复用线程 + 限制并发，避免线程数膨胀。
+
+---
+
+### 3.1 线程池执行流程源码级 + Worker 生命周期 + 状态流转
+
+**`ThreadPoolExecutor.execute` 全流程**
+
+```java
+public void execute(Runnable command) {
+    int c = ctl.get();
+    // 1. 核心线程未满：直接新增 Worker
+    if (workerCountOf(c) < corePoolSize) {
+        if (addWorker(command, true)) return;
+        c = ctl.get();
+    }
+    // 2. 入队（线程池 RUNNING 且队列未满）
+    if (isRunning(c) && workQueue.offer(command)) {
+        int recheck = ctl.get();
+        if (!isRunning(recheck) && remove(command))   // 二次校验，防 SHUTDOWN 后入队
+            reject(command);
+        else if (workerCountOf(recheck) == 0)          // 队列有任务但无线程（如核心为 0）
+            addWorker(null, false);
+    }
+    // 3. 队列满：尝试非核心线程，失败则拒绝
+    else if (!addWorker(command, false))
+        reject(command);
+}
+```
+
+**关键点**
+
+- `addWorker(command, true)`：`core=true` 受 corePoolSize 约束；`core=false` 受 maximumPoolSize 约束。
+- 入队前用 `offer`（非阻塞），有界队列满才返回 false → 触发非核心线程创建。
+- 二次校验：入队成功后线程池可能被 shutdown，需 remove + reject，避免任务滞留队列。
+- `workerCountOf == 0` 补救：core=0 + 队列有任务但无线程消费时，补一个非核心线程。
+- 顺序记忆口诀：**核心线程 → 队列 → 非核心线程 → 拒绝**（注意队列满才创建非核心，不是先到 max）。
+
+**`addWorker` 内部**
+
+```java
+// CAS 自增 workerCount（ctl 高 3 位状态 + 低 29 位计数）
+retry: for (;;) {
+    if (compareAndIncrementWorkerCount(c)) break retry;
+    ...
+}
+Worker w = new Worker(firstTask);          // Worker 持有 Thread + firstTask
+Thread t = w.thread;
+workers.add(w);                            // HashSet<Worker>
+t.start();                                 // 启动 Worker 线程
+```
+
+**Worker 生命周期（`runWorker`）**
+
+```java
+while ((task = getTask()) != null) {        // 循环取任务
+    try {
+        beforeExecute(wt, task);
+        task.run();                         // 执行任务
+        afterExecute(task, null);
+    } finally {
+        task = null;
+    }
+}
+processWorkerExit(w, ...);                  // 线程退出清理
+```
+
+**`getTask` 取任务逻辑（决定核心线程是否阻塞/退出）**
+
+```java
+boolean timed = allowCoreThreadTimeOut || workerCountOf(c) > corePoolSize;
+Runnable r = timed ?
+    workQueue.poll(keepAliveTime, TimeUnit.NANOSECONDS) :   // 非核心：超时取，超时返回 null → 退出
+    workQueue.take();                                        // 核心：阻塞取，永不退出
+```
+
+- `allowCoreThreadTimeOut=true`：核心线程也走 `poll`，超时退出。
+- SHUTDOWN 状态：继续消费完队列任务；STOP（shutdownNow）状态：立即停止，队列任务返回。
+
+**线程池 5 种状态（ctl 高 3 位）**
+
+| 状态 | 说明 | 行为 |
+|---|---|---|
+| RUNNING(-1) | 正常 | 接受新任务 + 处理队列 |
+| SHUTDOWN(0) | `shutdown()` | 不接新任务，处理完队列 |
+| STOP(1) | `shutdownNow()` | 不接新任务 + 丢弃队列 + 中断进行中 |
+| TIDYING(2) | 任务全空 + workers 空 | 调 `terminated()` |
+| TERMINATED(3) | `terminated` 完成 | 终态 |
+
+**关闭机制**
+
+- `shutdown()`：设 SHUTDOWN，中断空闲 Worker（取任务时 `take` 被中断返回 null 退出）。
+- `shutdownNow()`：设 STOP，中断所有 Worker，返回未执行任务列表。
+- `awaitTermination(timeout)`：阻塞等待终止。
+- 优雅停机：先 `shutdown` + `awaitTermination` 等待，超时再 `shutdownNow`。
+
+**状态流转图**
+
+```
+RUNNING --shutdown()--> SHUTDOWN --队列空+workers空--> TIDYING --terminated()--> TERMINATED
+   \                                                                                   /
+    ---shutdownNow()--> STOP --队列空+workers空--> TIDYING -----------------------------
+```
+
+**4 种拒绝策略**
+
+- `AbortPolicy`：抛 `RejectedExecutionException`（默认）。
+- `CallerRunsPolicy`：让提交线程自己跑，反压降速。
+- `DiscardPolicy`：静默丢。
+- `DiscardOldestPolicy`：丢队列最老任务再 `execute`（注意被锁任务可能再被丢）。
+
+**项目映射**
+
+- 风控平台：爬虫任务用 `ThreadPoolExecutor`，核心 8 + max 32 + 有界队列 1000 + `CallerRunsPolicy` 反压，避免任务堆积 OOM。
+- IOT 平台：协议解析用线程池隔离，CPU 密集 N+1，避免 IO 阻塞。
+
+**追问**
+
+- Q：为什么核心线程能一直存活？ A：`take()` 无超时阻塞，永不返回 null；除非 `allowCoreThreadTimeOut`。
+- Q：核心线程数为 0 时谁处理队列任务？ A：execute 第 2 步 `workerCountOf == 0` 补一个非核心线程消费。
+- Q：任务执行抛异常会怎样？ A：`runWorker` 的 `afterExecute` 收集异常，Worker 会被移除并新建一个替补线程；异常不向上抛（除非自定义 afterExecute）。
+- Q：如何实现核心线程预热？ A：`prestartAllCoreThreads()` 提前创建核心线程。
+- Q：动态调参？ A：`setCorePoolSize`/`setMaximumPoolSize` 运行期可调；Hippo4j/Dynamic-TP 接配置中心动态调。
 
 ---
 
@@ -1109,6 +1227,150 @@ EXPLAIN select ...
 **追问**
 
 - Q：Netty 解决空轮询 bug？ A：`Selector` 空轮询后重建新的 Selector，把 channel 迁移过去。
+
+---
+
+### 37.1 Netty 原理详解：Reactor 演进 + EventLoop + Pipeline + ByteBuf + 为什么快
+
+**Reactor 模型演进**
+
+| 模型 | 组件 | 特点 |
+|---|---|---|
+| 单线程 Reactor | 1 个线程做 accept + read + 业务 | 简单但单点瓶颈，Redis/Netty 的早期 NioEventLoop |
+| 多线程 Reactor | 1 个 accept 线程 + N 个 IO 线程 | IO 分散到多线程，业务仍在 IO 线程 |
+| 主从 Reactor（Netty 主流） | BossGroup accept + WorkerGroup IO + 业务线程池 | accept 与 IO 分离，重业务独立线程池 |
+
+- Netty 默认主从：BossGroup 通常 1 个线程（一个端口一个 ServerSocketChannel）。
+- WorkerGroup 默认 `CPU 核数 × 2`。
+
+**核心组件**
+
+- `EventLoop`（单线程 + 任务队列）：绑定一个 Selector，处理 IO 事件 + 普通任务 + 定时任务。
+- `EventLoopGroup`：多个 EventLoop，Channel 终身绑定一个 EventLoop（线程安全保证）。
+- `Channel`：socket 封装（NioServerSocketChannel/NioSocketChannel），提供 read/write/connect。
+- `ChannelPipeline`：双向责任链，由 `ChannelHandlerContext` 串联的 `ChannelHandler`。
+- `ChannelHandler`：业务处理器（`ChannelInboundHandler` 入站、`ChannelOutboundHandler` 出站）。
+- `ByteBuf`：Netty 自研字节缓冲，替代 NIO `ByteBuffer`。
+- `ChannelFuture`：异步操作结果，addListener 回调。
+
+**EventLoop 执行逻辑**
+
+```
+run() {
+    for (;;) {
+        // 1. 处理 IO 事件（select 阻塞，有时间任务则带超时）
+        select(deadline);
+        processSelectedKeys();      // 处理就绪的 SelectionKey
+        // 2. 处理普通任务队列
+        runAllTasks(timeoutNanos);
+    }
+}
+```
+
+- IO 任务与普通任务同线程串行执行，避免业务阻塞 IO。
+- 普通任务由其他线程 `channel.eventLoop().execute(task)` 提交。
+- `ioRatio` 控制 IO 与普通任务时间比（默认 50%）。
+
+**Pipeline 双向流转**
+
+```
+入站（读）：Head -> InHandler1 -> InHandler2 -> Tail
+出站（写）：Tail -> OutHandler2 -> OutHandler1 -> Head
+```
+
+- 入站事件（channelActive/channelRead）从 Head 往后传。
+- 出站事件（write/bind/close）从 Tail 往前传（注意出站 handler 顺序与注册顺序相反）。
+- `ctx.fireChannelRead(msg)` 传递到下一个入站 handler。
+- `ctx.write(msg)` 触发出站，从当前 ctx 往前找 OutboundHandler。
+
+**典型服务端启动**
+
+```java
+EventLoopGroup boss = new NioEventLoopGroup(1);
+EventLoopGroup worker = new NioEventLoopGroup();
+ServerBootstrap b = new ServerBootstrap();
+b.group(boss, worker)
+ .channel(NioServerSocketChannel.class)
+ .option(ChannelOption.SO_BACKLOG, 1024)
+ .childOption(ChannelOption.TCP_NODELAY, true)
+ .childHandler(new ChannelInitializer<SocketChannel>() {
+     protected void initChannel(SocketChannel ch) {
+         ch.pipeline()
+           .addLast(new LengthFieldBasedFrameDecoder(...))   // 拆包
+           .addLast(new StringDecoder())
+           .addLast(new MyBizHandler());
+     }
+ });
+ChannelFuture f = b.bind(8080).sync();
+f.channel().closeFuture().sync();
+```
+
+**ByteBuf 设计**
+
+- 读写指针分离（`readerIndex`/`writerIndex`），无需 flip，比 NIO ByteBuffer 易用。
+- 支持堆缓冲（`HeapByteBuf`）与直接内存（`DirectByteBuf`，零拷贝基础）。
+- 池化（`PooledByteBufAllocator`，默认）：基于 jemalloc 分区分配，减少 GC。
+- 引用计数：`retain`/`release`，`refCnt==0` 释放内存；泄漏检测 `ResourceLeakDetector`。
+- 组合视图：`CompositeByteBuf` 逻辑合并多 buffer，无内存拷贝。
+
+**Netty 零拷贝（4 层）**
+
+1. **OS 层**：`FileRegion` 走 `sendfile`，文件 → 网卡不经用户态。
+2. **堆外内存**：`DirectByteBuf` 直接在 Native 内存，省内核→用户态拷贝。
+3. **逻辑合并**：`CompositeByteBuf` / `wrappedBuffer` 合并 buffer 无拷贝。
+4. **切片共享**：`ByteBuf.slice()` 共享底层数组，仅改读写指针。
+
+**为什么 Netty 快**
+
+- 主从 Reactor，IO 线程独立，无锁。
+- 单 EventLoop 串行处理其所有 Channel，无竞争。
+- 零拷贝 + 池化 ByteBuf + 堆外内存。
+- 高效并发数据结构（`MpscQueue` 多生产单消费无锁队列）。
+- 优化的 Selector 使用（空轮询修复、`selectedKeys` 用 Set 优化为数组）。
+- 串行无锁化设计减少上下文切换。
+
+**粘包/拆包解决**
+
+- `FixedLengthFrameDecoder`：定长。
+- `LineBasedFrameDecoder`：换行分隔。
+- `DelimiterBasedFrameDecoder`：自定义分隔符。
+- `LengthFieldBasedFrameDecoder`：长度字段（最常用，自定义协议头）。
+
+```
++--------+--------+----------+
+| 长度(4)| 类型(1)|  body...  |
++--------+--------+----------+
+```
+
+```java
+new LengthFieldBasedFrameDecoder(
+    1024,        // 最大帧长
+    0, 4,        // 长度字段偏移与长度
+    0, 4);       // 解析后剥离长度字段
+```
+
+**内存管理与泄漏**
+
+- 池化 ByteBuf 必须 `release`（`refCnt` 归零才回收），否则内存泄漏。
+- 谁最后使用谁负责释放：通常是 pipeline 末端 handler 或出站写完成后由 Netty 释放。
+- `ReferenceCountUtil.release(msg)` 兜底。
+- `-Dio.netty.leakDetection.level=PARANOID` 排查泄漏。
+
+**Reactor 单线程为何高效（Redis/Netty 共性）**
+
+- 无锁、无上下文切换。
+- IO 多路复用 epoll 边沿/水平触发。
+- 内存操作为主，CPU 不是瓶颈。
+- 适合连接数多 + 单连接请求轻量的场景。
+
+**追问**
+
+- Q：为什么 Channel 绑定固定 EventLoop？ A：保证同一 channel 的所有操作同线程执行，无并发问题，handler 无需加锁。
+- Q：业务慢会阻塞 IO 线程吗？ A：会，EventLoop 串行；重业务应 `addLast(bizGroup, handler)` 或 handler 内提交到独立线程池。
+- Q：`write` 和 `writeAndFlush` 区别？ A：`write` 入出站队列待 flush；`writeAndFlush` 立即触发 flush 到 socket。
+- Q：Netty 怎么做心跳保活？ A：`IdleStateHandler` 检测空闲触发事件，自定义 handler 发心跳/断连；TCP 层 `SO_KEEPALIVE` 兜底。
+- Q：如何压测 Netty 性能？ A：wrk/locust + 连接数/QPS 监控；调 `ioRatio`、`SO_BACKLOG`、`TCP_NODELAY`、DirectBuf 比例。
+- Q：Netty 4 vs 3？ A：4 用 `FastThreadLocal`、线程模型简化、API 稳定；3 已弃用。
 
 ---
 

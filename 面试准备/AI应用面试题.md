@@ -504,6 +504,102 @@ async def crawl(req: CrawlReq, bg: BackgroundTasks):
 
 ---
 
+### 14.1 SSE vs WebSocket：区别、选型与 AI 场景落地
+
+**核心区别**
+
+| 维度 | SSE（Server-Sent Events） | WebSocket |
+|---|---|---|
+| 协议 | HTTP/1.1（或 HTTP/2） | 独立协议 ws:// wss://（基于 HTTP 升级握手） |
+| 通信方向 | 单向：服务器 → 客户端 | 全双工：双向实时 |
+| 底层连接 | 普通 HTTP 长连接 | 升级后的 TCP 长连接 |
+| 数据格式 | 纯文本 `text/event-stream`，按事件帧 | 任意（文本/二进制），自带帧协议 |
+| 浏览器 API | `EventSource` | `WebSocket` 对象 |
+| 自动重连 | 内置（断线自动重连 + `Last-Event-ID` 续传） | 需手动实现 |
+| 代理/防火墙 | 走 HTTP，穿透性好 | 需代理支持 ws 升级 |
+| 连接数限制 | HTTP/1.1 同域名 6 连接（HTTP/2 多路复用解除） | 无此限制 |
+| 鉴权 | 走 HTTP header/Cookie，简单 | 握手后需自行鉴权（header 仅握手阶段） |
+| 服务端成本 | 轻量，复用 HTTP 基础设施 | 需长连接维护、心跳、状态管理 |
+| 适用 | 服务器推：LLM 流式输出、通知、行情、日志 | 双向实时：聊天、协作、游戏、多人同步 |
+
+**SSE 协议帧**
+
+```
+data: 第一块内容\n
+\n
+data: 第二块内容\n
+\n
+event: done\n
+data: [DONE]\n
+\n
+```
+
+- 每条事件以 `\n\n` 分隔；`data:` 是数据行；可加 `event:`/`id:`/`retry:`。
+- `id` 用于断线后 `Last-Event-ID` 请求头续传，服务器据此重放。
+
+**FastAPI SSE 实现**
+
+```python
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+
+app = FastAPI()
+
+@app.post("/chat")
+async def chat(req: ChatReq):
+    async def gen():
+        async for chunk in llm.astream(req.prompt):
+            yield f"data: {chunk.content}\n\n"
+        yield "data: [DONE]\n\n"
+    return StreamingResponse(gen(), media_type="text/event-stream")
+```
+
+前端：
+
+```js
+const es = new EventSource("/chat?prompt=...");
+es.onmessage = e => console.log(e.data);
+es.addEventListener("done", () => es.close());
+```
+
+**WebSocket 实现（FastAPI）**
+
+```python
+from fastapi import FastAPI, WebSocket
+
+app = FastAPI()
+
+@app.websocket("/ws")
+async def ws(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            msg = await ws.receive_text()        # 客户端 -> 服务端
+            await ws.send_text(f"echo: {msg}")     # 服务端 -> 客户端
+    except WebSocketDisconnect:
+        pass
+```
+
+需自行处理：心跳（ping/pong，默认 20s 超时）、重连、鉴权（握手时校验 token）。
+
+**AI 场景选型**
+
+- **LLM 流式输出 → SSE**：单向推送、HTTP 复用、自动重连、首字时延低，OpenAI/Claude/vLLM 默认用 SSE。
+- **多轮对话（用户可中途打断/追问）→ WebSocket**：双向，客户端随时发消息，服务端流式回。
+- **实时协同（代码助手、Agent 进度、多人会议纪要）→ WebSocket**：双向 + 低延迟。
+- **服务端推送（任务进度、行情、审核结果）→ SSE**：单向足够，简单可靠。
+
+**追问**
+
+- Q：LLM 流式为什么默认用 SSE 而不是 WebSocket？ A：单向即可，复用 HTTP 基础设施（负载均衡、鉴权、限流、CDN），断线自动重连 + 续传，部署简单；WebSocket 双向但需额外维护心跳/重连/状态。
+- Q：SSE 在 HTTP/1.1 下的连接数限制？ A：同域名 6 条，多路复用 HTTP/2 解除；生产建议 HTTP/2 + 同域。
+- Q：SSE 如何做鉴权？ A：`EventSource` 不支持自定义 header，用 Cookie（同源）或 query token；或用 `fetch` + ReadableStream 自行实现 SSE 客户端以带 header。
+- Q：WebSocket 鉴权怎么做？ A：握手阶段（HTTP 升级请求）用 header/cookie/query 带 token 校验；握手后无 HTTP 语义，需在应用层加鉴权消息。
+- Q：Nginx 反代 SSE/WebSocket 注意？ A：SSE 关闭 `proxy_buffering` + 设长 `proxy_read_timeout`；WebSocket 加 `proxy_set_header Upgrade $http_upgrade;` + `Connection upgrade` + `proxy_http_version 1.1`。
+- Q：SSE vs HTTP 分块传输（chunked）？ A：SSE 是 chunked 之上的应用协议（事件帧 + 自动重连 + event 类型）；裸 chunked 无语义，浏览器需手动解析。
+
+---
+
 ### 15. Dify / FastGPT / LlamaIndex / LangChain 对比
 
 | 框架 | 定位 | 优势 | 适用 |
