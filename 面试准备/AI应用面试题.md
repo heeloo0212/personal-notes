@@ -261,6 +261,145 @@ Action: ...
 
 ---
 
+### 7.1 多 Agent 场景下的状态机设计
+
+> 面试官追问：多个 Agent 协作时怎么管"现在该谁动、走到哪一步、能不能回退"？答案是把整个协作流程抽象成**显式状态机（State Machine）**，让流程可控、可观测、可恢复，而不是靠 LLM 自由发挥导致乱跑。
+
+#### 一、为什么 Multi-Agent 必须有状态机
+
+- LLM 本身无状态、不确定，多 Agent 自由对话容易：跑偏、死循环、重复调用、漏步骤、并发冲突。
+- 状态机把"流程"从"模型"剥离：模型只负责单步决策，状态机负责编排/路由/校验/容错。
+- 好处：可重放（出 bug 能复现）、可恢复（崩溃后续跑）、可观测（每步状态落库）、可降级（状态分支可挂人工）。
+- 主流框架都内置状态机思想：LangGraph（显式 `StateGraph`）、Dify 工作流、AutoGen（有限状态机编排）、Semantic Kernel（Planner + Process）。
+
+#### 二、状态机的四个核心元素
+
+1. **State（状态）**：系统当前快照，通常用一个结构体/字典承载全局信息。
+2. **Node（节点）**：状态转移的动作，每个 Node 是一个 Agent 或一段逻辑（可以是 LLM 调用、工具、规则、人工节点）。
+3. **Edge（边/转移条件）**：从一个状态到下一个状态的路由规则——可以是静态连线，也可以是"条件边"由 LLM/规则动态判定。
+4. **Channel/Reducer（状态合并策略）**：多 Agent 并行写同一字段时如何合并（覆盖、追加、求和、投票）。
+
+#### 三、状态结构怎么设计
+
+- **全局共享 State**：所有 Agent 读写同一份上下文，避免逐个传参丢信息。
+  ```python
+  class RiskState(TypedDict):
+      materials: dict            # 原始材料
+      id_result: dict            # 身份认证 Agent 结果
+      bank_result: dict          # 银行流水 Agent 结果
+      work_result: dict          # 工作证明 Agent 结果
+      messages: Annotated[list, add]   # 消息历史，reducer=追加
+      risk_score: float
+      step: str                  # 当前状态标识
+      errors: list
+  ```
+- **Annotated Reducer**：LangGraph 用 `Annotated[list, add]` 指定并行节点写同一字段时的合并策略（追加/覆盖/last-writer-wins），解决并发写冲突。
+- **状态字段建议**：业务数据 + 流程控制字段（`current_node`/`iteration`/`retry_count`/`status`）+ 错误信息 + 中间产物，便于断点恢复。
+- **避免把全部对话原文塞 State**：长上下文会爆 token，关键结论结构化存，原文按 id 引用。
+
+#### 四、节点设计原则
+
+- **单一职责**：一个 Node 干一件事（一个 Agent 或一步工具），便于复用与测试。
+- **节点是"纯函数"**：`State in -> State out`，无副作用或副作用隔离，保证可重放。
+- **混合节点类型**：LLM 节点（推理）、工具节点（执行）、规则节点（校验/裁决）、人工节点（Human-in-the-loop）、并行节点（fan-out）、聚合节点（fan-in）。
+- **幂等**：重试或恢复时同一输入应得相同输出，工具调用要做幂等。
+
+#### 五、转移/路由设计
+
+- **静态边**：A → B 固定连线，流程确定。
+- **条件边（conditional edge）**：根据 State 字段动态路由，由规则或 LLM 判定下一节点。
+  ```python
+  graph.add_conditional_edges(
+      "manager",
+      lambda s: "need_id"  if not s["id_result"] else
+                "need_bank" if not s["bank_result"] else
+                "aggregate",
+      {"need_id": "id_agent", "need_bank": "bank_agent", "aggregate": "final"}
+  )
+  ```
+- **循环边**：需要多轮迭代（如反复核验）时回到上游节点，必须配 `max_iterations` + 终止条件防死循环。
+- **终止条件**：目标达成、步数超限、错误超限、置信度达标、人工中断。
+
+#### 六、并行与汇聚
+
+- **Fan-out**：独立子任务并行（身份/流水/工作证明同时跑），用 `Send` 或并行边。
+- **Fan-in**：汇聚所有并行结果，用 Reducer 合并（如银行流水 + 工作证明结果汇总到 `risk_score`）。
+- **屏障（barrier）**：等所有并行分支完成再进汇聚节点，避免部分结果未到就裁决。
+- **部分失败处理**：超时兜底、缺字段用默认值、失败分支单独走重试/降级分支，不阻塞整体。
+
+#### 七、容错与恢复
+
+- **检查点（Checkpoint）**：每步 State 持久化（Redis/DB），崩溃后从最近 checkpoint 续跑。
+- **重试策略**：节点级重试（指数退避）+ 全局重试上限；不可重试错误走降级。
+- **超时**：单节点 + 全流程超时，防 LLM 卡死。
+- **降级分支**：LLM 失败 → 规则兜底 → 人工兜底。
+- **死信/隔离**：反复失败的任务转入人工队列，状态标记 `need_human`，避免无限重试。
+- **回滚**：部分写副作用（如已下发动作）需补偿事务（Saga 思路）。
+
+#### 八、可观测性
+
+- **状态轨迹**：记录每次状态转移 `{node, input_state, output_state, duration, tokens, error}`。
+- **可视化**：LangGraph Studio、Langfuse trace 能看状态机执行图。
+- **指标**：各节点耗时/token/失败率、状态停留分布、循环次数分布。
+
+#### 九、LangGraph 实战骨架
+
+```python
+from langgraph.graph import StateGraph, END
+from typing import TypedDict, Annotated
+
+def add(a, b): return a + b
+
+class S(TypedDict):
+    materials: dict
+    id_result: dict
+    bank_result: dict
+    final: dict
+    msgs: Annotated[list, add]
+
+g = StateGraph(S)
+g.add_node("manager", manager_node)
+g.add_node("id_agent", id_node)
+g.add_node("bank_agent", bank_node)
+g.add_node("aggregate", agg_node)
+
+g.set_entry_point("manager")
+g.add_conditional_edges("manager", route, {"id": "id_agent", "bank": "bank_agent", "done": "aggregate"})
+g.add_edge("id_agent", "manager")     # 回到 manager 决策下一步
+g.add_edge("bank_agent", "manager")
+g.add_edge("aggregate", END)
+
+app = g.compile(checkpointer=MemorySaver())   # 自动 checkpoint
+app.invoke(initial_state, config={"configurable": {"thread_id": "case-001"}})
+```
+
+- `MemorySaver`/`SqliteSaver`/`PostgresSaver` 做持久化，`thread_id` 区分会话，支持断点续跑。
+- `interrupt_before`/`interrupt_after` 实现 Human-in-the-loop：到指定节点前暂停等人工确认。
+
+#### 十、与"无状态自由编排"的对比
+
+| 维度 | 状态机编排 | LLM 自由编排 |
+|---|---|---|
+| 可控性 | 流程显式，路由可校验 | 依赖 LLM 自觉，易跑偏 |
+| 可恢复 | checkpoint 续跑 | 难，需重头 |
+| 可观测 | 状态轨迹清晰 | 黑盒 |
+| 可测试 | 节点单测 | 难 |
+| 灵活度 | 改流程要改图 | 改 prompt 即可 |
+| 适合 | 金融风控/审批/工业级流程 | 探索/开放式任务 |
+
+- 经验：**关键路径用状态机保可控，开放子任务内部允许 ReAct 自由发挥**，外层刚性内层柔性。
+
+#### 十一、追问
+
+- Q：状态机会不会太死板限制 Agent 智能性？ A：状态机管"流程骨架"，单节点内仍可放 LLM 自由推理；死板换可控，关键流程值得。
+- Q：状态怎么持久化、如何续跑？ A：每步 State + node 落 checkpoint（DB/Redis），用 case_id/thread_id 关联，重启读 checkpoint 跳到当前节点续跑。
+- Q：多个 Agent 同时写同一字段冲突怎么办？ A：用 Reducer 显式定义合并策略（追加/覆盖/投票/求和），LangGraph `Annotated[T, reducer]`。
+- Q：循环怎么防死循环？ A：每个循环边配 `iteration` 计数 + 上限 + 终止条件（目标达成/置信度/超时），状态机层强校验。
+- Q：人工介入怎么接入？ A：`interrupt_before` 暂停 + 状态置 `pending_human`，人工审核后写回 State 再 `invoke` 续跑。
+- Q：和 Dify 工作流/BPMN 区别？ A：本质都是状态机；LangGraph 偏代码级灵活 + LLM 条件边，Dify 偏可视化拖拽，BPMN 偏业务流程标准；选型看团队与场景。
+
+---
+
 ### 8. Agent 记忆机制 + 长期记忆
 
 **短期**
@@ -1276,6 +1415,118 @@ services:
   - 流式输出降感知延迟。
   - 批处理（continuous batching）。
   - KV 缓存复用前缀（vLLM prefix caching）。
+
+---
+
+### 38.1 Agent 设计中的 Prompt 缓存与 Token 节省
+
+> 面试官高频追问：Agent 多步调用、长 system prompt + 工具描述 + few-shot，token 成本和延迟爆炸怎么治？答案分两块——**Prompt 缓存**（命中复用省 prefill）+ **Token 节省**（从源头减少）。
+
+#### 一、Prompt 缓存（命中即省 prefill 计算与费用）
+
+**1. 厂商原生 Prompt Caching（最省心）**
+
+- OpenAI（gpt-4o/4.1/o 系列）、Anthropic Claude、DeepSeek、Qwen、Kimi 等已支持「前缀缓存」。
+- 原理：把长 prompt 的「稳定前缀」计算出的 KV 缓存按哈希存下来，下次请求前缀相同则跳过 prefill，直接复用 KV，只对新 token 做增量计算。
+- 计费：缓存命中部分通常按 0.1×~0.5× input 计费（OpenAI 缓存命中 0.5x、写入 1.25x；Anthropic 命中 0.1x、写入 1.25x），延迟大幅下降。
+- API 用法：OpenAI 自动缓存（≥1024 token 才缓存），无需显式声明；Anthropic 用 `cache_control` 标记缓存点。
+
+**Anthropic 显式缓存示例**
+
+```python
+messages = [
+    {"role": "user", "content": [
+        {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}},  # 缓存点1
+        {"type": "text", "text": TOOLS_DESC,    "cache_control": {"type": "ephemeral"}},    # 缓存点2
+        {"type": "text", "text": few_shot_examples},
+        {"type": "text", "text": user_query}   # 动态部分放最后，不缓存
+    ]}
+]
+```
+
+- 最多 4 个缓存断点；TTL 默认 5 分钟（可配 1 小时）；命中后过期前有效。
+
+**2. 命中条件（关键，否则缓存形同虚设）**
+
+- **前缀必须逐 token 完全一致**：任一字符差异（包括空格、换行、动态变量）都 miss。
+- 所以 Agent 设计铁律：**静态放前面、动态放后面**。
+  - 顺序：system prompt → 工具/函数定义 → few-shot → 历史对话 → 当前 query。
+  - 绝不在前缀里塞时间戳、随机 id、用户名等动态值。
+- 前缀长度 ≥ 阈值（OpenAI 1024、Anthropic 1024/2048 起）。
+- 缓存键：按模型 + prompt 前缀哈希，所以换模型即 miss。
+
+**3. 自部署用 vLLM Prefix Caching / SGLang RadixAttention**
+
+- vLLM：`--enable-prefix-caching`，自动按 token 前缀哈希存 KV 块，命中复用。
+- SGLang RadixAttention：基于 Radix 树管理前缀，共享前缀的多个请求复用 KV，命中率更高。
+- 适用：Agent 反复用同一 system prompt + tool schema + few-shot，多轮/多请求复用。
+- 注意：temperature/top_p 等采样参数不影响 prefill 缓存（KV 计算与采样无关），可放心缓存。
+
+**4. 语义缓存（Semantic Cache，跨用户/跨会话）**
+
+- 原理：把 query 向量化存向量库，新 query 检索相似度 ≥ 阈值则直接返回历史答案。
+- 工具：GPTCache、LangChain `CacheBackedEmbeddings`、Redis + embedding。
+- 适用：客服/FAQ 这类「问题相似、答案稳定」场景；**不适用于**要求时效性/个性化强的 Agent。
+- 风险：相似不等于相同，误命中答错；需加 TTL + 人工校验 + 黑白名单。
+
+**5. KV 缓存复用（推理层）**
+
+- vLLM 自动 PagedAttention + prefix caching，同一会话多轮复用前缀 KV。
+- 超长对话时省去重复 prefill，TTFT 显著下降。
+
+#### 二、Token 节省（从源头减量）
+
+**Prompt 结构优化**
+
+- **静态前置**：system + tools + few-shot 固定放最前，吃满缓存。
+- **去冗余**：删「请认真思考」「你是一个专业助手」等空话；用短指令 + 示例代替长说明。
+- **结构化工具描述**：用 JSON Schema 而非自然语言长描述；工具多时只注入「本步可能用到」的子集（小模型先做 tool router）。
+- **few-shot 精简**：1-2 个高质量示例 > 10 个冗余示例；示例 token 占大头时尤其要砍。
+
+**Agent 流程优化**
+
+- **小模型路由**：3B/8B 做「意图分类 / 工具选择 / 简单 QA」，命中即不调大模型，省 90% 成本。
+- **工具调用裁剪**：每次只把「当前决策需要」的工具描述注入，而不是全量工具集（工具越多 prompt 越长）。
+- **RAG 召回裁剪**：检索 top-20 但只把最相关 top-3-5 + rerank 拼进上下文，别把 20 段全塞。
+- **记忆压缩**：旧对话用摘要（Summary Memory）代替全量拼接；长记忆只检索相关片段注入。
+- **早停 / 短路**：能规则解决的不走 LLM；能查缓存的不重新生成。
+- **并行替代串行**：独立子任务并行调用，减少串行轮次（虽不省 token 但省延迟和轮次叠加误差）。
+
+**输出端控制**
+
+- 限制 `max_tokens`，防止长篇大论。
+- 要求结构化输出（JSON/表格），天然更短、易解析、可复用。
+- 用 `stop` 序列提前结束。
+- 不需要的步骤让模型「只输出关键字」而非完整句子。
+
+**工程层缓存**
+
+- 完整响应缓存（按 query hash 精确命中）：高频同 query 直接返回。
+- 部分结果缓存：工具调用结果缓存（同一企业核验多次复用）。
+- Embedding 缓存：同段文本不重复 embed。
+
+#### 三、实战编排（风控 Agent 举例）
+
+```
+[system: 风控审核员角色]            ← 静态，缓存点1
+[tools: 身份/流水/工作证明 Agent 描述] ← 静态，缓存点2
+[few-shot: 2 个标准 JSON 输出示例]    ← 静态，缓存点3
+[本次材料 OCR 结构化文本]            ← 动态，放最后
+[输出要求: 仅 JSON]
+```
+
+- 前三段几乎不变 → 厂商缓存命中率 90%+，input 费用降 80%、TTFT 降 60%。
+- 工具结果（企业核验）单独缓存到 Redis，同一企业 24h 内复用。
+- 简单身份证校验走规则 + 小模型，不进大模型。
+
+#### 四、追问
+
+- Q：为什么前缀变了就缓存全 miss？ A：厂商按「从第一个 token 起的连续前缀」算 hash，中间断了就只缓存断点之前的部分；所以动态内容必须放最后。
+- Q：Prompt 缓存和 KV 缓存是一回事吗？ A：KV 缓存是推理引擎层（vLLM）复用计算结果；Prompt 缓存（厂商 API）是服务端把 KV 缓存持久化 + 计费优惠，本质都是复用 prefill。
+- Q：语义缓存什么时候别用？ A：答案强时效（行情/库存）、强个性化（用户私有数据）、要求精确（金融/医疗）时慎用，相似 query 误命中代价高。
+- Q：温度高会影响缓存吗？ A：不影响 prefill 缓存（KV 计算与采样无关），但高温输出不稳定，语义缓存命中率会下降。
+- Q：多 Agent 怎么统一省？ A：共用同一 system + tool schema 前缀（最大复用）、Manager 用小模型、子 Agent 结果缓存、并行 + 工具结果复用。
+- Q：如何观测缓存效果？ A：记录每次 input token 中「缓存命中 token 数 / 总 input token」比例，命中费率、TTFT；Langfuse/LangSmith trace 里看 cache_read_input_tokens。
 
 ---
 
