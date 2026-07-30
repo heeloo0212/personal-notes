@@ -400,6 +400,173 @@ app.invoke(initial_state, config={"configurable": {"thread_id": "case-001"}})
 
 ---
 
+### 7.2 多 Agent 流式输出 + 逐步工具调用过程可见
+
+> 面试官追问：多 Agent 协作时，用户怎么"边看生成边看每一步调了什么工具、参数、结果"？这是把"黑盒推理"变成"可观测流式过程"的工程问题。核心：**流式分块 + 事件分类 + 工具调用前后发事件**，前端按事件类型渲染不同 UI。
+
+#### 一、需求拆解
+
+- **流式文本**：LLM 生成的文字逐字/逐块吐到前端（打字机效果）。
+- **过程可见**：每一步 Agent/工具调用的「开始、入参、结果、耗时、归属哪个 Agent」都要展示。
+- **多 Agent**：N 个 Agent 串/并行，要标明"当前是哪个 Agent 在工作"。
+- **不阻塞**：工具执行（搜索/OCR）耗时长，不能等完才出字；要异步 + 进度推送。
+
+#### 二、整体方案
+
+1. **后端用 SSE/WebSocket 推送事件流**（见 14.1，单向推首选 SSE）。
+2. **定义统一事件协议**：`event_type` 区分 `token` / `tool_call` / `tool_result` / `agent_start` / `agent_end` / `error` / `done`。
+3. **LLM 流式 + 工具调用钩子**：底层用 SDK 的 `astream` 拿 token 增量，工具执行前后发事件。
+4. **LangGraph/LangChain 的 streaming events**：`astream_events` 天然吐细粒度事件（on_chat_model_stream / on_tool_start / on_tool_end）。
+5. **前端按事件渲染**：token 拼到当前气泡，tool_call 渲染成可折叠卡片（工具名 + 参数 + 状态 + 结果）。
+
+#### 三、统一事件协议（SSE 帧格式）
+
+```
+event: agent_start
+data: {"agent": "id_agent", "step": 1, "ts": 1700000000}
+
+event: token
+data: {"agent": "id_agent", "text": "正在"}
+
+event: token
+data: {"agent": "id_agent", "text": "识别身份证"}
+
+event: tool_call
+data: {"agent": "id_agent", "tool": "ocr_id_card", "args": {"img": "id_001.jpg"}, "call_id": "c1"}
+
+event: tool_result
+data: {"agent": "id_agent", "call_id": "c1", "ok": true, "data": {"name": "..."}, "cost_ms": 320}
+
+event: agent_end
+data: {"agent": "id_agent", "step": 1, "result": "..."}
+
+event: done
+data: {"final": "..."}
+```
+
+- 前端按 `event` 路由渲染：`token` 追加文字、`tool_call` 建卡片并置 loading、`tool_result` 填充结果、`agent_start/end` 切换 Agent 标签。
+
+#### 四、FastAPI + SSE 后端骨架
+
+```python
+import json, asyncio, time
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+
+app = FastAPI()
+
+def sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+async def run_agent_stream(agent_name, task, send):
+    await send(sse("agent_start", {"agent": agent_name, "ts": time.time()}))
+    # 1) LLM 流式输出 token
+    async for chunk in llm.astream(task):
+        if chunk.content:
+            await send(sse("token", {"agent": agent_name, "text": chunk.content}))
+    # 2) 工具调用（这里用一个同步模拟，实际异步执行）
+    tool_args = {"img": task["img"]}
+    await send(sse("tool_call", {"agent": agent_name, "tool": "ocr_id_card",
+                                 "args": tool_args, "call_id": "c1"}))
+    t0 = time.time()
+    result = await asyncio.to_thread(ocr_id_card, **tool_args)  # 异步不阻塞
+    await send(sse("tool_result", {"agent": agent_name, "call_id": "c1",
+                                   "ok": True, "data": result, "cost_ms": int((time.time()-t0)*1000)}))
+    await send(sse("agent_end", {"agent": agent_name, "result": result}))
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatReq):
+    async def gen():
+        q: asyncio.Queue = asyncio.Queue()
+        async def send(msg): await q.put(msg)
+        # 多 Agent 并行/串行编排
+        async def pipeline():
+            await run_agent_stream("id_agent",   {"img": req.id_img}, send)
+            await run_agent_stream("bank_agent", {"img": req.bank_img}, send)
+            await send(sse("done", {"final": "风控完成"}))
+            await q.put(None)   # 结束信号
+        asyncio.create_task(pipeline())   # 后台跑，事件入队
+        while True:
+            msg = await q.get()
+            if msg is None: break
+            yield msg
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+```
+
+要点：
+- 用 `asyncio.Queue` 把"编排任务"与"SSE 输出"解耦，编排各步骤随时 `send` 事件，输出循环统一转发。
+- 耗时工具用 `asyncio.to_thread` 包，不阻塞事件循环。
+- `X-Accel-Buffering: no` 关闭 Nginx 缓冲，保证流式实时。
+
+#### 五、LangGraph/LangChain 的 `astream_events`（推荐，省去手写事件）
+
+```python
+async for ev in graph.astream_events(initial_state, version="v2"):
+    kind = ev["event"]
+    if kind == "on_chat_model_stream":
+        chunk = ev["data"]["chunk"].content
+        if chunk:
+            await send(sse("token", {"agent": ev["name"], "text": chunk}))
+    elif kind == "on_tool_start":
+        await send(sse("tool_call", {"agent": ev["name"], "tool": ev["name"],
+                                     "args": ev["data"].get("input")}))
+    elif kind == "on_tool_end":
+        await send(sse("tool_result", {"agent": ev["name"],
+                                       "data": ev["data"].get("output")}))
+    elif kind == "on_chain_start":
+        await send(sse("agent_start", {"agent": ev["name"]}))
+    elif kind == "on_chain_end":
+        await send(sse("agent_end", {"agent": ev["name"], "result": ev["data"].get("output")}))
+```
+
+- `version="v2"` 是当前稳定事件版本；事件按节点/工具/模型分层，天然覆盖多 Agent。
+- 配合 LangGraph 的 checkpoint，还能"断点续看"历史过程。
+
+#### 六、前端消费（EventSource）
+
+```js
+const es = new EventSource(`/chat/stream?...`);
+const bubbles = {};
+es.addEventListener("agent_start", e => {
+  const d = JSON.parse(e.data);
+  bubbles[d.agent] = createBubble(d.agent);
+});
+es.addEventListener("token", e => {
+  const d = JSON.parse(e.data);
+  bubbles[d.agent].appendText(d.text);
+});
+es.addEventListener("tool_call", e => {
+  const d = JSON.parse(e.data);
+  bubbles[d.agent].addToolCard(d.tool, d.args, "running");
+});
+es.addEventListener("tool_result", e => {
+  const d = JSON.parse(e.data);
+  bubbles[d.agent].updateToolCard(d.call_id, d.data, "done", d.cost_ms);
+});
+es.addEventListener("done", e => { es.close(); });
+```
+
+#### 七、关键工程点
+
+- **背压控制**：客户端慢时 SSE 缓冲堆积，后端用限流/丢历史 token（保最新）。
+- **token 与 tool 事件交错**：LLM 边生成边决定调工具（function calling 流式）时，token 和 `tool_call` 会交织，前端按 `call_id` 关联。
+- **并发 Agent 的归属标识**：每条事件带 `agent` 字段，前端按 Agent 分气泡/分栏渲染，避免串台。
+- **错误事件**：工具失败发 `error` 事件 + 是否重试/降级标记，前端显示「重试中/已降级」。
+- **可重放**：事件流同步落库（按 case_id），用户刷新可回放全过程；与 7.1 状态机的 checkpoint 互补。
+- **观测**：事件即 trace，可喂 Langfuse/LangSmith 做耗时/token 分析。
+
+#### 八、追问
+
+- Q：为什么用 SSE 而非 WebSocket？ A：单向推送够用、复用 HTTP 基础设施、断线自动重连、Nginx 易透传；双向需用户中途打断才用 WebSocket（见 14.1）。
+- Q：工具执行很久用户怎么知道进度？ A：工具内部再发 `tool_progress` 事件（百分比/阶段），或拆成多个子步骤事件。
+- Q：function calling 流式时怎么区分"工具调用 JSON"和"普通文本"？ A：SDK 的 `astream` 会把工具调用的 `tool_call_chunks` 单独给出，不要把它的 arguments 当文本渲染。
+- Q：多 Agent 并行时事件顺序乱怎么办？ A：每条带 `agent`+`ts`，前端按 Agent 分流各自保序，全局不强制顺序；需全局顺序则加序号 `seq`。
+- Q：如何做到"可回放"？ A：所有事件按 `case_id` 落库（DB/ES），刷新时按 seq 重放渲染；或 LangGraph checkpoint 恢复状态。
+- Q：token 事件太频繁前端卡顿？ A：前端做节流/批量追加（攒 30ms 一次性 append），或用 `requestAnimationFrame` 合并 DOM 更新。
+
+---
+
 ### 8. Agent 记忆机制 + 长期记忆
 
 **短期**
